@@ -378,9 +378,9 @@ struct common_params_speculative_ngram_cache {
 
 struct common_params_speculative_ngram_gate {
     bool    enabled = false; // gate n-gram drafters by their recent measured acceptance
-    float   rate    = 0.50f; // minimum accepted/proposed token ratio that keeps a drafter open
-    int32_t window  = 64;    // proposed tokens to accumulate before judging a drafter
-    int32_t probe   = 16;    // gated rounds between probe drafts that let a drafter recover
+    float   rate    = 0.40f; // minimum accepted/proposed token ratio that keeps a drafter open
+    int32_t window  = 32;    // proposed tokens to accumulate before judging a drafter
+    int32_t probe   = 8;     // gated rounds between probe drafts that let a drafter recover
 };
 
 struct common_params_speculative {
