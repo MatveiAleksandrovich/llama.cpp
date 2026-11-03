@@ -18,6 +18,31 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// Direct Q4_0/Q8_0 loading is limited to the tested SM86 dense-Qwen attention shape.
+// A zero environment value restores upstream's global FP16 conversion path.
+static inline bool ggml_cuda_direct_quant(const int cc, const ggml_tensor * dst) {
+    static const bool enabled_q4 = [] {
+        const char * value = getenv("GGML_CUDA_DIRECT_Q4");
+        return !value || strcmp(value, "0") != 0;
+    }();
+    static const bool enabled_q8 = [] {
+        const char * value = getenv("GGML_CUDA_DIRECT_Q8");
+        return !value || strcmp(value, "0") != 0;
+    }();
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    return cc == 860 && !dst->src[5] && K->type == V->type &&
+        ((enabled_q4 && K->type == GGML_TYPE_Q4_0) || (enabled_q8 && K->type == GGML_TYPE_Q8_0)) &&
+        Q->ne[0] == 256 && Q->ne[1] >= 1 && Q->ne[1] <= 8 && Q->ne[2] == 24 && Q->ne[3] == 1 &&
+        K->ne[0] == 256 && K->ne[1] >= 8192 && K->ne[2] == 4 && K->ne[3] == 1 &&
+        V->ne[0] == 256 && V->ne[1] == K->ne[1] && V->ne[2] == 4 && V->ne[3] == 1 &&
+        K->nb[1] % 8 == 0 && V->nb[1] % 8 == 0 &&
+        K->nb[1] <= INT32_MAX - 4 && V->nb[1] <= INT32_MAX - 4 &&
+        ggml_get_op_params_i32(dst, 4) == 0;
+}
+
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -1017,8 +1042,13 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
+    const bool direct_quant = stream_k && !use_sparse && need_f16_K && need_f16_V &&
+        ncols1 <= 8 && ggml_cuda_direct_quant(cc, dst);
+    const int quant_stride_tag = direct_quant && K->type == GGML_TYPE_Q8_0 ? 4 : 0;
+    const bool convert_K = need_f16_K && !direct_quant;
+    const bool convert_V = need_f16_V && !direct_quant;
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, convert_K, convert_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
@@ -1034,7 +1064,7 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    if (convert_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -1062,7 +1092,7 @@ void launch_fattn(
         K_data = (char *) K_f16;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (convert_V && V->type != GGML_TYPE_F16) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
@@ -1271,8 +1301,9 @@ void launch_fattn(
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
-        nb21, nb22, nb23,
+        // Negative strides mark quantized rows; bit 2 of their magnitude selects Q8_0.
+        K->ne[0], n_kv, K->ne[2], K->ne[3], direct_quant ? -(int32_t(nb11) + quant_stride_tag) : int32_t(nb11), nb12, nb13,
+        direct_quant ? -(int32_t(nb21) + quant_stride_tag) : int32_t(nb21), nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
     );

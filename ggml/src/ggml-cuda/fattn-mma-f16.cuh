@@ -380,16 +380,73 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
 
 // ------------------------------------------------------------------------------------------------------------------
 
-template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
+template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse, bool allow_direct_quant>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV,
-        const int k_VKQ_0, const int i_sup, const int32_t * const __restrict__ indices) {
+        const int k_VKQ_0, const int i_sup, const int32_t * const __restrict__ indices, const int quant_element_offset = 0) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     // K/V data is loaded with decreasing granularity for D for better memory bandwidth.
     // The minimum granularity is 16 bytes.
     constexpr int chunk_size = 16;
     constexpr int h2_per_chunk = chunk_size / sizeof(half2);
     const int chunks_per_row = D2 / h2_per_chunk;
+
+    if constexpr (allow_direct_quant && !use_sparse) {
+        if (stride_KV < 0) {
+            // Source byte strides are divisible by eight. After division by sizeof(half2),
+            // bit zero of the negative stride magnitude carries the Q8_0 tag.
+            const bool is_q8 = (-stride_KV & 1) != 0;
+            const int row_bytes = (-stride_KV - int(is_q8)) * int(sizeof(half2));
+            const char * rows = reinterpret_cast<const char *>(KV) + int64_t(k_VKQ_0)*row_bytes;
+            for (int index = warp_size*threadIdx.y + threadIdx.x;
+                 index < nbatch_fa*chunks_per_row; index += nwarps*warp_size) {
+                const int row = index / chunks_per_row;
+                const int chunk = index % chunks_per_row;
+                __align__(16) half2 values[4];
+                if (!oob_check || row < i_sup) {
+                    const int element = quant_element_offset + chunk*8;
+                    if (is_q8) {
+                        const block_q8_0 * block = reinterpret_cast<const block_q8_0 *>(
+                            rows + int64_t(row)*row_bytes) + element/QK8_0;
+                        const int offset = element % QK8_0;
+                        const half2 scale = __half2half2(block->d);
+                        const half2 bias = make_half2(1152.0f, 1152.0f);
+#pragma unroll
+                        for (int pair = 0; pair < 4; ++pair) {
+                            const uint32_t packed = reinterpret_cast<const uint16_t *>(block->qs + offset)[pair] ^ 0x8080u;
+                            union { uint32_t u; half2 h; } value;
+                            value.u = 0x64006400u | (packed & 0xffu) | ((packed & 0xff00u) << 8);
+                            values[pair] = __hmul2(__hsub2(value.h, bias), scale);
+                        }
+                    } else {
+                        const block_q4_0 * block = reinterpret_cast<const block_q4_0 *>(
+                            rows + int64_t(row)*row_bytes) + element/QK4_0;
+                        const int offset = element % (QK4_0/2);
+                        const int shift = ((element % QK4_0) / (QK4_0/2))*4;
+                        const half2 scale = __half2half2(block->d);
+                        const half2 bias = make_half2(1032.0f, 1032.0f);
+#pragma unroll
+                        for (int pair = 0; pair < 4; ++pair) {
+                            const uint32_t packed = reinterpret_cast<const uint16_t *>(block->qs + offset)[pair];
+                            const uint32_t nibbles = (packed >> shift) & 0x0f0fu;
+                            union { uint32_t u; half2 h; } value;
+                            value.u = 0x64006400u | (nibbles & 0x0fu) | ((nibbles & 0x0f00u) << 8);
+                            values[pair] = __hmul2(__hsub2(value.h, bias), scale);
+                        }
+                    }
+                } else {
+#pragma unroll
+                    for (int pair = 0; pair < 4; ++pair) {
+                        values[pair] = make_half2(0.0f, 0.0f);
+                    }
+                }
+                ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, row*stride_tile + chunk*h2_per_chunk, row), values);
+            }
+            __syncthreads();
+            return;
+        }
+    }
+
     if constexpr (use_cp_async) {
         static_assert(warp_size == 32, "bad warp_size");
         static_assert(!oob_check || use_sparse, "OOB check not compatible with cp_async");
@@ -639,7 +696,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr bool use_cp_async = true;
         cp_async_wait_all();
         __syncthreads();
-        flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+        flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse, (DKQ == 256 && DV == 256 && ncols1 <= 8)>
             (V_h2, tile_V, nbatch_V2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
     } else {
         // the sparse mask values are gathered per element, always load them synchronously
@@ -659,8 +716,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             const int k0_diff = k0_stop - k0_start;
             constexpr bool use_cp_async = nstages == 1;
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
+            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse, (DKQ == 256 && DV == 256 && ncols1 <= 8)>
+                (stride_K < 0 ? K_h2 : K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices, 2*k0_start);
             if (use_cp_async) {
                 cp_async_wait_all();
             }
@@ -996,7 +1053,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                     (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
             }
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse, (DKQ == 256 && DV == 256 && ncols1 <= 8)>
                 (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, indices);
         }
     }
@@ -1012,8 +1069,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int i0_diff = i0_stop - i0_start;
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
-                flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-                    (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
+                flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse, (DKQ == 256 && DV == 256 && ncols1 <= 8)>
+                    (stride_V < 0 ? V_h2 : V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices, i0_start);
                 if (use_cp_async) {
                     cp_async_wait_all();
                 }
@@ -1348,7 +1405,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
         }
-        flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+        flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse, (DKQ == 256 && DV == 256 && ncols1 <= 8)>
             (K_h2, tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, indices);
     }
 
@@ -1889,10 +1946,10 @@ static __global__ void flash_attn_ext_f16(
 
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
-    const int stride_K    = nb11 / sizeof(half2);
+    const int stride_K    = nb11 / int(sizeof(half2));
     const int stride_mask = nb31 / sizeof(half);
 
-    const int stride_V = V_is_K_view ? stride_K : nb21 / sizeof(half2);
+    const int stride_V = V_is_K_view ? stride_K : nb21 / int(sizeof(half2));
 
     const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
