@@ -376,6 +376,13 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+struct common_params_speculative_ngram_gate {
+    bool    enabled = false; // gate n-gram drafters by their recent measured acceptance
+    float   rate    = 0.50f; // minimum accepted/proposed token ratio that keeps a drafter open
+    int32_t window  = 64;    // proposed tokens to accumulate before judging a drafter
+    int32_t probe   = 16;    // gated rounds between probe drafts that let a drafter recover
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -385,6 +392,7 @@ struct common_params_speculative {
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
+    common_params_speculative_ngram_gate ngram_gate;
     common_params_speculative_ngram_mod ngram_mod;
     common_params_speculative_ngram_map ngram_simple;
     common_params_speculative_ngram_map ngram_map_k;
