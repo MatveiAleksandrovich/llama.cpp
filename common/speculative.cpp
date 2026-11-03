@@ -3032,6 +3032,17 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         return;
     }
 
+    // a new prompt starts with a fresh gate: the previous request content says
+    // nothing about how repetitive this one will be
+    for (auto & kv : spec->gate_states) {
+        if ((size_t) seq_id < kv.second.size()) {
+            kv.second[seq_id] = {};
+        }
+    }
+    if ((size_t) seq_id < spec->draft_n_last.size()) {
+        spec->draft_n_last[seq_id] = 0;
+    }
+
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
