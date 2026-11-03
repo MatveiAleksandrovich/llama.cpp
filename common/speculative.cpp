@@ -3032,11 +3032,17 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         return;
     }
 
-    // a new prompt starts with a fresh gate: the previous request content says
-    // nothing about how repetitive this one will be
+    // the gate verdict carries across prompts on a slot: consecutive requests in a
+    // session tend to look alike, and relearning from scratch costs a window of bad
+    // drafts per request. a closed drafter instead probes on the new prompt first
+    // round, so a request that turns repetitive reopens it immediately
     for (auto & kv : spec->gate_states) {
         if ((size_t) seq_id < kv.second.size()) {
-            kv.second[seq_id] = {};
+            auto & st = kv.second[seq_id];
+            st.probing = false;
+            if (!st.open) {
+                st.n_blocked = (uint32_t) std::max(0, spec->gate.probe);
+            }
         }
     }
     if ((size_t) seq_id < spec->draft_n_last.size()) {
