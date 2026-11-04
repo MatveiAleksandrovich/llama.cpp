@@ -4317,6 +4317,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--spec-ngram-gate"},
+        string_format("gate n-gram drafters by their recent measured acceptance; a drafter below the bar is paused and probed periodically (default: %s)", params.speculative.ngram_gate.enabled ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.speculative.ngram_gate.enabled = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_GATE"));
+    add_opt(common_arg(
+        {"--spec-ngram-gate-rate"}, "P",
+        string_format("minimum accepted/proposed token ratio that keeps a gated n-gram drafter open (default: %.2f)", params.speculative.ngram_gate.rate),
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_gate.rate = std::stof(value);
+            if (params.speculative.ngram_gate.rate < 0.0f || params.speculative.ngram_gate.rate > 1.0f) {
+                throw std::invalid_argument("ngram gate rate must be between 0.0 and 1.0 inclusive");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_GATE_RATE"));
+    add_opt(common_arg(
+        {"--spec-ngram-gate-window"}, "N",
+        string_format("proposed tokens to accumulate before judging a gated n-gram drafter (default: %d)", params.speculative.ngram_gate.window),
+        [](common_params & params, int value) {
+            if (value < 4 || value > 4096) {
+                throw std::invalid_argument("ngram gate window must be between 4 and 4096 inclusive");
+            }
+            params.speculative.ngram_gate.window = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_GATE_WINDOW"));
+    add_opt(common_arg(
+        {"--spec-ngram-gate-probe"}, "N",
+        string_format("gated rounds between probe drafts that let a paused n-gram drafter recover (default: %d)", params.speculative.ngram_gate.probe),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 4096) {
+                throw std::invalid_argument("ngram gate probe must be between 1 and 4096 inclusive");
+            }
+            params.speculative.ngram_gate.probe = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_NGRAM_GATE_PROBE"));
+    add_opt(common_arg(
         {"--spec-ngram-simple-size-m"}, "N",
         string_format("ngram size M for ngram-simple speculative decoding, length of draft m-gram (default: %d)", params.speculative.ngram_simple.size_m),
         [](common_params & params, int value) {

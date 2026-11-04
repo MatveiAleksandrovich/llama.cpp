@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <unordered_map>
 #include <iomanip>
 #include <map>
 #include <random>
@@ -176,6 +177,19 @@ using common_speculative_draft_params_vec = std::vector<common_speculative_draft
 //
 // each implementation has a unique type and a state that is implementation-specific
 // in a subclass of common_speculative_impl
+static bool common_speculative_type_is_ngram(common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 struct common_speculative_impl {
     const common_speculative_type type;
 
@@ -2427,6 +2441,15 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+// recent per-sequence performance of one n-gram drafter, for the acceptance gate
+struct common_speculative_gate_state {
+    uint32_t n_gen = 0;      // tokens the drafter proposed inside the current window
+    uint32_t n_acc = 0;      // of them, tokens the target model accepted
+    bool     open  = true;   // a closed drafter is skipped except for probe rounds
+    uint32_t n_blocked = 0;  // rounds skipped since the gate closed, schedules probes
+    bool     probing   = false; // the draft in flight is a probe and decides reopening
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -2437,6 +2460,11 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // n-gram acceptance gate (--spec-ngram-gate)
+    common_params_speculative_ngram_gate gate;
+    std::unordered_map<const common_speculative_impl *, std::vector<common_speculative_gate_state>> gate_states;
+    std::vector<uint16_t> draft_n_last; // size of the last winning draft per seq, for gate accounting
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -2975,6 +3003,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .synth_probs = */ {},
     });
 
+    result->gate = params.ngram_gate;
+    result->draft_n_last.assign(n_seq, 0);
+
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
     const auto rates = common_speculative_synth_rates_resolve(&params, n_max_effective);
@@ -3025,6 +3056,23 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         return;
     }
 
+    // the gate verdict carries across prompts on a slot: consecutive requests in a
+    // session tend to look alike, and relearning from scratch costs a window of bad
+    // drafts per request. a closed drafter instead probes on the new prompt first
+    // round, so a request that turns repetitive reopens it immediately
+    for (auto & kv : spec->gate_states) {
+        if ((size_t) seq_id < kv.second.size()) {
+            auto & st = kv.second[seq_id];
+            st.probing = false;
+            if (!st.open) {
+                st.n_blocked = (uint32_t) std::max(0, spec->gate.probe);
+            }
+        }
+    }
+    if ((size_t) seq_id < spec->draft_n_last.size()) {
+        spec->draft_n_last[seq_id] = 0;
+    }
+
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
@@ -3070,10 +3118,38 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        // n-gram gate: hide the sequences whose recent n-gram acceptance is below the bar,
+        // except for periodic probe rounds that let a paused drafter recover
+        std::vector<llama_seq_id> gate_hidden;
+        if (spec->gate.enabled && common_speculative_type_is_ngram(impl->type)) {
+            auto & states = spec->gate_states[impl.get()];
+            if (states.size() < dparams.size()) {
+                states.resize(dparams.size());
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+                auto & dp = dparams[seq_id];
+                auto & st = states[seq_id];
+                st.probing = false;
+                if (!dp.drafting || st.open) {
+                    continue;
+                }
+                if ((int32_t) st.n_blocked >= spec->gate.probe) {
+                    st.probing   = true;
+                    st.n_blocked = 0;
+                    continue;
+                }
+                st.n_blocked++;
+                dp.drafting = false;
+                gate_hidden.push_back(seq_id);
+            }
+        }
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
             impl->n_call_draft++;
+        }
+        for (const llama_seq_id seq_id : gate_hidden) {
+            dparams[seq_id].drafting = true;
         }
 
         int n_drafting = 0;
@@ -3110,6 +3186,9 @@ void common_speculative_draft(common_speculative * spec) {
 
                     // remember which implementation was used
                     spec->impl_last[seq_id] = impl.get();
+                    if ((size_t) seq_id < spec->draft_n_last.size()) {
+                        spec->draft_n_last[seq_id] = (uint16_t) result.size();
+                    }
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
@@ -3162,6 +3241,41 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
         impl->accept(seq_id, n_accepted, false);
         impl->n_call_accept++;
+    }
+
+    // n-gram gate accounting: judge the drafter that produced this round's draft
+    if (spec->gate.enabled && common_speculative_type_is_ngram(impl->type)) {
+        auto & states = spec->gate_states[impl];
+        if ((size_t) seq_id < states.size()) {
+            auto & st = states[seq_id];
+            const uint32_t n_gen = (size_t) seq_id < spec->draft_n_last.size() ? spec->draft_n_last[seq_id] : 0;
+            st.n_gen += n_gen;
+            st.n_acc += n_accepted;
+            if (st.probing) {
+                // one probe decides: a good probe reopens the drafter, a bad one keeps it paused
+                const bool good = n_gen > 0 && (float) n_accepted >= spec->gate.rate * (float) n_gen;
+                st.probing = false;
+                st.open    = good;
+                if (good) {
+                    st.n_gen = 0;
+                    st.n_acc = 0;
+                    SPC_DBG("ngram gate reopened for seq %d after probe (%u/%u)\n", seq_id, (unsigned) n_accepted, n_gen);
+                } else {
+                    st.n_blocked = 0;
+                }
+            } else if (st.open && (int32_t) st.n_gen >= spec->gate.window) {
+                const float r = (float) st.n_acc / (float) st.n_gen;
+                if (r < spec->gate.rate) {
+                    st.open      = false;
+                    st.n_blocked = 0;
+                    SPC_DBG("ngram gate closed for seq %d (windowed rate %.2f < %.2f)\n", seq_id, r, spec->gate.rate);
+                } else {
+                    // keep the window recent: halve so new rounds dominate the judgement
+                    st.n_gen /= 2;
+                    st.n_acc /= 2;
+                }
+            }
+        }
     }
 
     // accept with the rest of the implementations, using is_other == true
